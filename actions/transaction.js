@@ -6,6 +6,7 @@ import { revalidatePath } from "next/cache";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import aj from "@/lib/arcjet";
 import { request } from "@arcjet/next";
+import { balanceDelta, parseTransactionInput } from "@/lib/transaction-input";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
@@ -15,10 +16,11 @@ const serializeAmount = (obj) => ({
 });
 
 // Create Transaction
-export async function createTransaction(data) {
+export async function createTransaction(rawData) {
   try {
     const { userId } = await auth();
     if (!userId) throw new Error("Unauthorized");
+    const data = parseTransactionInput(rawData);
 
     // Get request data for ArcJet
     const req = await request();
@@ -65,11 +67,9 @@ export async function createTransaction(data) {
       throw new Error("Account not found");
     }
 
-    // Calculate new balance
-    const balanceChange = data.type === "EXPENSE" ? -data.amount : data.amount;
-    const newBalance = account.balance.toNumber() + balanceChange;
-
-    // Create transaction and update account balance
+    // Create transaction and apply its effect to the balance atomically.
+    // An increment (not "read balance, then write balance + change") cannot
+    // lose a concurrent update from another transaction or the recurring job.
     const transaction = await db.$transaction(async (tx) => {
       const newTransaction = await tx.transaction.create({
         data: {
@@ -83,8 +83,8 @@ export async function createTransaction(data) {
       });
 
       await tx.account.update({
-        where: { id: data.accountId },
-        data: { balance: newBalance },
+        where: { id: data.accountId, userId: user.id },
+        data: { balance: { increment: balanceDelta(data.type, data.amount) } },
       });
 
       return newTransaction;
@@ -121,10 +121,11 @@ export async function getTransaction(id) {
   return serializeAmount(transaction);
 }
 
-export async function updateTransaction(id, data) {
+export async function updateTransaction(id, rawData) {
   try {
     const { userId } = await auth();
     if (!userId) throw new Error("Unauthorized");
+    const data = parseTransactionInput(rawData);
 
     const user = await db.user.findUnique({
       where: { clerkUserId: userId },
@@ -145,16 +146,18 @@ export async function updateTransaction(id, data) {
 
     if (!originalTransaction) throw new Error("Transaction not found");
 
-    // Calculate balance changes
-    const oldBalanceChange =
-      originalTransaction.type === "EXPENSE"
-        ? -originalTransaction.amount.toNumber()
-        : originalTransaction.amount.toNumber();
+    // The target account must belong to the caller too.
+    const movesAccount = data.accountId !== originalTransaction.accountId;
+    if (movesAccount) {
+      const target = await db.account.findUnique({
+        where: { id: data.accountId, userId: user.id },
+      });
+      if (!target) throw new Error("Account not found");
+    }
 
-    const newBalanceChange =
-      data.type === "EXPENSE" ? -data.amount : data.amount;
-
-    const netBalanceChange = newBalanceChange - oldBalanceChange;
+    // Calculate balance changes (exact decimals)
+    const oldBalanceChange = balanceDelta(originalTransaction.type, originalTransaction.amount);
+    const newBalanceChange = balanceDelta(data.type, data.amount);
 
     // Update transaction and account balance in a transaction
     const transaction = await db.$transaction(async (tx) => {
@@ -172,21 +175,30 @@ export async function updateTransaction(id, data) {
         },
       });
 
-      // Update account balance
-      await tx.account.update({
-        where: { id: data.accountId },
-        data: {
-          balance: {
-            increment: netBalanceChange,
-          },
-        },
-      });
+      // Update account balances. When the transaction moves to another
+      // account, its old effect is reversed on the original account.
+      if (movesAccount) {
+        await tx.account.update({
+          where: { id: originalTransaction.accountId, userId: user.id },
+          data: { balance: { increment: oldBalanceChange.neg() } },
+        });
+        await tx.account.update({
+          where: { id: data.accountId, userId: user.id },
+          data: { balance: { increment: newBalanceChange } },
+        });
+      } else {
+        await tx.account.update({
+          where: { id: data.accountId, userId: user.id },
+          data: { balance: { increment: newBalanceChange.minus(oldBalanceChange) } },
+        });
+      }
 
       return updated;
     });
 
     revalidatePath("/dashboard");
     revalidatePath(`/account/${data.accountId}`);
+    if (movesAccount) revalidatePath(`/account/${originalTransaction.accountId}`);
 
     return { success: true, data: serializeAmount(transaction) };
   } catch (error) {
